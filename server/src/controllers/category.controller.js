@@ -1,0 +1,313 @@
+import asyncHandler from "../utils/asyncHandler.js";
+import ApiError from "../utils/ApiError.js";
+import ApiResponse from "../utils/ApiResponse.js";
+import Category from "../models/Category.model.js";
+import Product from "../models/Product.model.js";
+import {
+  uploadToCloudinary,
+  deleteFromCloudinary,
+} from "../utils/uploadToCloudinary.js";
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// @desc    Get all categories
+// @route   GET /api/v1/categories
+// @access  Public
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+export const getAllCategories = asyncHandler(async (req, res) => {
+  const {
+    includeInactive = "false",
+    tree            = "false",
+  } = req.query;
+
+  // Build filter
+  const filter = {};
+  if (includeInactive !== "true") {
+    filter.isActive = true;
+  }
+
+  const categories = await Category.find(filter)
+    .populate("parent", "name slug")
+    /*
+    populate("parent", "name slug"):
+      Instead of showing just the parent ObjectId,
+      Mongoose fetches the parent document and returns
+      only the name and slug fields.
+      
+      Without populate: "parent": "64f8a2b3c1d2e3f4a5b6c7d8"
+      With populate:    "parent": { "name": "Electronics", "slug": "electronics" }
+    */
+    .sort({ createdAt: -1 });
+
+  // Build tree structure if requested
+  /*
+  TREE FORMAT:
+    Instead of flat list, returns nested structure:
+    [
+      {
+        name: "Electronics",
+        subcategories: [
+          { name: "Phones", subcategories: [...] },
+          { name: "Laptops", subcategories: [...] }
+        ]
+      }
+    ]
+  */
+  if (tree === "true") {
+    const buildTree = (categories, parentId = null) => {
+      return categories
+        .filter((cat) => {
+          if (parentId === null) return !cat.parent;
+          return cat.parent?._id?.toString() === parentId?.toString();
+        })
+        .map((cat) => ({
+          ...cat.toObject(),
+          subcategories: buildTree(categories, cat._id),
+        }));
+    };
+
+    const categoryTree = buildTree(categories);
+
+    return res.status(200).json(
+      new ApiResponse(
+        200,
+        { categories: categoryTree },
+        "Categories fetched successfully"
+      )
+    );
+  }
+
+  return res.status(200).json(
+    new ApiResponse(
+      200,
+      {
+        categories,
+        total: categories.length,
+      },
+      "Categories fetched successfully"
+    )
+  );
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// @desc    Get single category by slug
+// @route   GET /api/v1/categories/:slug
+// @access  Public
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+export const getCategoryBySlug = asyncHandler(async (req, res) => {
+  const category = await Category.findOne({
+    slug:     req.params.slug,
+    isActive: true,
+  }).populate("parent", "name slug");
+
+  if (!category) {
+    throw new ApiError(404, "Category not found");
+  }
+
+  // Get subcategories of this category
+  const subcategories = await Category.find({
+    parent:   category._id,
+    isActive: true,
+  }).select("name slug image productCount");
+
+  // Get product count for this category
+  const productCount = await Product.countDocuments({
+    category: category._id,
+    isActive: true,
+  });
+
+  return res.status(200).json(
+    new ApiResponse(
+      200,
+      {
+        category,
+        subcategories,
+        productCount,
+      },
+      "Category fetched successfully"
+    )
+  );
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// @desc    Create new category
+// @route   POST /api/v1/categories
+// @access  Admin
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+export const createCategory = asyncHandler(async (req, res) => {
+  const { name, description, parent, isActive } = req.body;
+
+  // 1. Check if category with same name already exists
+  const existingCategory = await Category.findOne({
+    name: { $regex: new RegExp(`^${name}$`, "i") },
+    /*
+    Case-insensitive check:
+    "Electronics" and "electronics" are treated as same
+    Prevents duplicate categories with different casing
+    */
+  });
+
+  if (existingCategory) {
+    throw new ApiError(409, "Category with this name already exists");
+  }
+
+  // 2. If parent provided, verify it exists
+  if (parent) {
+    const parentCategory = await Category.findById(parent);
+    if (!parentCategory) {
+      throw new ApiError(404, "Parent category not found");
+    }
+  }
+
+  // 3. Build category data
+  const categoryData = {
+    name,
+    description: description || "",
+    isActive:    isActive !== undefined ? isActive : true,
+  };
+
+  if (parent) categoryData.parent = parent;
+
+  // 4. Handle image upload if provided
+  if (req.file) {
+    const uploaded = await uploadToCloudinary(
+      req.file.path,
+      "ecommerce/categories"
+    );
+
+    if (uploaded) {
+      categoryData.image = {
+        url:      uploaded.url,
+        publicId: uploaded.publicId,
+      };
+    }
+  }
+
+  // 5. Create category — slug auto-generated by pre-save hook
+  const category = await Category.create(categoryData);
+
+  return res.status(201).json(
+    new ApiResponse(201, { category }, "Category created successfully")
+  );
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// @desc    Update category
+// @route   PUT /api/v1/categories/:id
+// @access  Admin
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+export const updateCategory = asyncHandler(async (req, res) => {
+  const { name, description, parent, isActive } = req.body;
+
+  const category = await Category.findById(req.params.id);
+
+  if (!category) {
+    throw new ApiError(404, "Category not found");
+  }
+
+  // Check name conflict (only if name is being changed)
+  if (name && name !== category.name) {
+    const existingCategory = await Category.findOne({
+      name: { $regex: new RegExp(`^${name}$`, "i") },
+      _id:  { $ne: req.params.id }, // Exclude current category
+    });
+
+    if (existingCategory) {
+      throw new ApiError(409, "Category with this name already exists");
+    }
+  }
+
+  // Prevent category from being its own parent
+  if (parent && parent === req.params.id) {
+    throw new ApiError(400, "Category cannot be its own parent");
+  }
+
+  // Verify parent exists if provided
+  if (parent) {
+    const parentCategory = await Category.findById(parent);
+    if (!parentCategory) {
+      throw new ApiError(404, "Parent category not found");
+    }
+  }
+
+  // Handle image upload
+  if (req.file) {
+    // Delete old image from Cloudinary
+    if (category.image?.publicId) {
+      await deleteFromCloudinary(category.image.publicId);
+    }
+
+    // Upload new image
+    const uploaded = await uploadToCloudinary(
+      req.file.path,
+      "ecommerce/categories"
+    );
+
+    if (uploaded) {
+      category.image = {
+        url:      uploaded.url,
+        publicId: uploaded.publicId,
+      };
+    }
+  }
+
+  // Update fields
+  if (name        !== undefined) category.name        = name;
+  if (description !== undefined) category.description = description;
+  if (parent      !== undefined) category.parent      = parent;
+  if (isActive    !== undefined) category.isActive    = isActive;
+
+  await category.save();
+
+  return res.status(200).json(
+    new ApiResponse(200, { category }, "Category updated successfully")
+  );
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// @desc    Delete category
+// @route   DELETE /api/v1/categories/:id
+// @access  Admin
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+export const deleteCategory = asyncHandler(async (req, res) => {
+  const category = await Category.findById(req.params.id);
+
+  if (!category) {
+    throw new ApiError(404, "Category not found");
+  }
+
+  // 1. Check if category has products
+  const productCount = await Product.countDocuments({
+    category: req.params.id,
+  });
+
+  if (productCount > 0) {
+    throw new ApiError(
+      400,
+      `Cannot delete category. It has ${productCount} product(s) assigned to it. Please reassign or delete the products first.`
+    );
+  }
+
+  // 2. Check if category has subcategories
+  const subcategoryCount = await Category.countDocuments({
+    parent: req.params.id,
+  });
+
+  if (subcategoryCount > 0) {
+    throw new ApiError(
+      400,
+      `Cannot delete category. It has ${subcategoryCount} subcategorie(s). Please delete subcategories first.`
+    );
+  }
+
+  // 3. Delete image from Cloudinary if exists
+  if (category.image?.publicId) {
+    await deleteFromCloudinary(category.image.publicId);
+  }
+
+  // 4. Delete category
+  await Category.findByIdAndDelete(req.params.id);
+
+  return res.status(200).json(
+    new ApiResponse(200, {}, "Category deleted successfully")
+  );
+});

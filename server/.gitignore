@@ -1,0 +1,12 @@
+.env
+.env.local
+.env.production
+
+# Build files
+dist/
+build/
+
+# Temp files
+uploads/
+*.log
+.DS_Store
